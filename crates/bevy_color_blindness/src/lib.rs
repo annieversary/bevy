@@ -2,11 +2,12 @@
 //! color blindness.
 
 use bevy_app::{App, Plugin};
-use bevy_asset::{load_internal_asset, Assets, Handle, HandleUntyped};
+use bevy_asset::{load_internal_asset, AssetEvent, Assets, Handle, HandleUntyped};
 use bevy_core_pipeline::core_2d::Camera2dBundle;
 use bevy_ecs::{
     component::Component,
     entity::Entity,
+    prelude::{EventReader, EventWriter},
     query::{Added, Changed},
     system::{Commands, Query, Res, ResMut},
 };
@@ -14,11 +15,11 @@ use bevy_math::{Vec2, Vec3};
 use bevy_reflect::TypeUuid;
 use bevy_render::{
     camera::{Camera, RenderTarget},
-    mesh::{shape, Mesh},
+    mesh::{shape, Indices, Mesh},
     prelude::Image,
     render_resource::{
-        AsBindGroup, Extent3d, Shader, ShaderRef, ShaderType, TextureDescriptor, TextureDimension,
-        TextureFormat, TextureUsages,
+        AsBindGroup, Extent3d, PrimitiveTopology, Shader, ShaderRef, ShaderType, TextureDescriptor,
+        TextureDimension, TextureFormat, TextureUsages,
     },
     texture::BevyDefault,
     view::RenderLayers,
@@ -26,7 +27,7 @@ use bevy_render::{
 use bevy_sprite::{Material2d, Material2dPlugin, MaterialMesh2dBundle};
 use bevy_transform::prelude::Transform;
 use bevy_ui::entity::UiCameraConfig;
-use bevy_window::Windows;
+use bevy_window::{WindowId, WindowResized, Windows};
 
 /// Plugin to simulate and preview different types of
 /// color blindness.
@@ -90,16 +91,26 @@ impl Plugin for ColorBlindnessPlugin {
             "color_blindness.wgsl",
             Shader::from_wgsl
         );
+        load_internal_asset!(
+            app,
+            SCREEN_VERTEX_SHADER_HANDLE,
+            "screen_vertex.wgsl",
+            Shader::from_wgsl
+        );
 
         app.add_plugin(Material2dPlugin::<ColorBlindnessMaterial>::default())
             .add_system(setup_new_color_blindness_cameras)
-            .add_system(update_percentages);
+            .add_system(update_percentages)
+            .add_system(update_image_to_window_size);
     }
 }
 
 /// handle to the color blindness simulation shader
 const COLOR_BLINDNESS_SHADER_HANDLE: HandleUntyped =
     HandleUntyped::weak_from_u64(Shader::TYPE_UUID, 3937837360667146578);
+/// handle to the color blindness simulation shader
+const SCREEN_VERTEX_SHADER_HANDLE: HandleUntyped =
+    HandleUntyped::weak_from_u64(Shader::TYPE_UUID, 3937837360667146579);
 
 /// The different modes of color blindness simulation supported.
 #[derive(Clone, Default, Debug)]
@@ -267,6 +278,9 @@ impl Material2d for ColorBlindnessMaterial {
     fn fragment_shader() -> ShaderRef {
         ShaderRef::Handle(COLOR_BLINDNESS_SHADER_HANDLE.typed())
     }
+    fn vertex_shader() -> ShaderRef {
+        ShaderRef::Handle(SCREEN_VERTEX_SHADER_HANDLE.typed())
+    }
 }
 
 /// Component to identify your main camera
@@ -291,6 +305,12 @@ pub struct ColorBlindnessCamera {
     ///
     /// Defaults to `false`
     pub enabled: bool,
+}
+
+#[derive(Component)]
+pub struct FitToWindowSize {
+    pub image: Handle<Image>,
+    pub window_id: WindowId,
 }
 
 /// updates the percentages in the post processing material when the values in `ColorBlindnessCamera` change
@@ -325,11 +345,12 @@ fn setup_new_color_blindness_cameras(
 ) {
     for (entity, mut camera, color_blindness_camera) in &mut cameras {
         let original_target = camera.target.clone();
-
+        let mut option_window_id: Option<WindowId> = None;
         // Get the size the camera is rendering to
         let size = match &camera.target {
             RenderTarget::Window(window_id) => {
                 let window = windows.get(*window_id).expect("ColorBlindnessCamera is rendering to a window, but this window could not be found");
+                option_window_id = Some(window_id.clone());
                 Extent3d {
                     width: window.physical_width(),
                     height: window.physical_height(),
@@ -368,12 +389,32 @@ fn setup_new_color_blindness_cameras(
         // This specifies the layer used for the post processing camera, which will be attached to the post processing camera and 2d quad.
         let post_processing_pass_layer =
             RenderLayers::layer((RenderLayers::TOTAL_LAYERS - 1) as u8);
+        let half_extents = Vec2::new(size.width as f32 / 2f32, size.height as f32 / 2f32);
+        let mut triangle_mesh = Mesh::new(PrimitiveTopology::TriangleList);
+        // NOTE: positions are actually not used because the vertex shader maps UV and clip space.
+        triangle_mesh.insert_attribute(
+            Mesh::ATTRIBUTE_POSITION,
+            vec![
+                [-half_extents.x, -half_extents.y, 0.0],
+                [half_extents.x * 3f32, -half_extents.y, 0.0],
+                [-half_extents.x, half_extents.y * 3f32, 0.0],
+            ],
+        );
+        triangle_mesh.set_indices(Some(Indices::U32(vec![0, 1, 2])));
+        triangle_mesh.insert_attribute(
+            Mesh::ATTRIBUTE_NORMAL,
+            vec![[0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]],
+        );
 
+        triangle_mesh.insert_attribute(
+            Mesh::ATTRIBUTE_UV_0,
+            vec![[2.0, 0.0], [0.0, 2.0], [0.0, 0.0]],
+        );
+        let triangle_handle = meshes.add(triangle_mesh);
         let quad_handle = meshes.add(Mesh::from(shape::Quad::new(Vec2::new(
             size.width as f32,
             size.height as f32,
         ))));
-
         // This material has the texture that has been rendered.
         let material_handle = post_processing_materials.add(ColorBlindnessMaterial {
             source_image: image_handle.clone(),
@@ -386,13 +427,19 @@ fn setup_new_color_blindness_cameras(
             .insert(material_handle.clone())
             // also disable show_ui so UI elements don't get rendered twice
             .insert(UiCameraConfig { show_ui: false });
+        if let Some(window_id) = option_window_id {
+            commands.entity(entity).insert(FitToWindowSize {
+                image: image_handle.clone(),
+                window_id,
+            });
+        }
 
         camera.target = RenderTarget::Image(image_handle);
 
         // Post processing 2d quad, with material using the render texture done by the main camera, with a custom shader.
         commands
             .spawn_bundle(MaterialMesh2dBundle {
-                mesh: quad_handle.into(),
+                mesh: triangle_handle.into(),
                 material: material_handle,
                 transform: Transform {
                     translation: Vec3::new(0.0, 0.0, 1.5),
@@ -407,13 +454,45 @@ fn setup_new_color_blindness_cameras(
             .spawn_bundle(Camera2dBundle {
                 camera: Camera {
                     // renders after the first main camera which has default value: 0.
-                    priority: 1,
+                    priority: camera.priority + 10,
                     // set this new camera to render to where the other camera was rendering
                     target: original_target,
                     ..Default::default()
                 },
                 ..Camera2dBundle::default()
             })
-            .insert(post_processing_pass_layer);
+            .insert(post_processing_pass_layer)
+            .id();
+        commands.entity(entity);
+    }
+}
+
+fn update_image_to_window_size(
+    windows: Res<Windows>,
+    mut image_events: EventWriter<AssetEvent<Image>>,
+    mut images: ResMut<Assets<Image>>,
+    mut resize_events: EventReader<WindowResized>,
+    fit_to_window_size: Query<&FitToWindowSize>,
+) {
+    for resize_event in resize_events.iter() {
+        if resize_event.id == WindowId::primary() {
+            for fit_to_window in fit_to_window_size.iter() {
+                let size = {
+                    let window = windows.get(fit_to_window.window_id).expect("ColorBlindnessCamera is rendering to a window, but this window could not be found");
+                    Extent3d {
+                        width: window.physical_width(),
+                        height: window.physical_height(),
+                        ..Default::default()
+                    }
+                };
+                let image = images.get_mut(&fit_to_window.image).expect(
+                    "FitToScreenSize is referring to an Image, but this Image could not be found",
+                );
+                image.resize(size);
+                image_events.send(AssetEvent::Modified {
+                    handle: fit_to_window.image.clone(),
+                });
+            }
+        }
     }
 }
