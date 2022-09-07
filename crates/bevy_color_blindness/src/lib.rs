@@ -2,12 +2,12 @@
 //! color blindness.
 
 use bevy_app::{App, Plugin};
-use bevy_asset::{load_internal_asset, Assets, Handle, HandleUntyped};
+use bevy_asset::{load_internal_asset, AssetEvent, Assets, Handle, HandleUntyped};
 use bevy_core_pipeline::core_2d::Camera2dBundle;
 use bevy_ecs::{
     component::Component,
     entity::Entity,
-    prelude::EventReader,
+    prelude::{EventReader, EventWriter},
     query::{Added, Changed},
     system::{Commands, Query, Res, ResMut},
 };
@@ -461,12 +461,15 @@ fn setup_new_color_blindness_cameras(
                 },
                 ..Camera2dBundle::default()
             })
-            .insert(post_processing_pass_layer);
+            .insert(post_processing_pass_layer)
+            .id();
+        commands.entity(entity);
     }
 }
 
 fn update_image_to_window_size(
     windows: Res<Windows>,
+    mut image_events: EventWriter<AssetEvent<Image>>,
     mut images: ResMut<Assets<Image>>,
     mut resize_events: EventReader<WindowResized>,
     fit_to_window_size: Query<&FitToWindowSize>,
@@ -486,6 +489,9 @@ fn update_image_to_window_size(
                     "FitToScreenSize is referring to an Image, but this Image could not be found",
                 );
                 image.resize(size);
+                image_events.send(AssetEvent::Modified {
+                    handle: fit_to_window.image.clone(),
+                });
             }
         }
     }
